@@ -1,14 +1,21 @@
 """Tests for review_service.py"""
 
+import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
 
+from api.schemas.review import ReviewResponse
+from core.models.profile import Profile
+from core.models.review import Review
 from core.services.review_service import (
     create_review,
     get_review,
     list_reviews,
+    process_review,
+    register_callback_url,
 )
 
 
@@ -377,3 +384,208 @@ class TestReviewService:
 
         # Should order by created_at descending
         mock_db_session.execute.assert_called_once()
+
+
+CALLBACK_URL = "http://listener.test/hook"
+
+
+@pytest.mark.unit
+class TestReviewWebhooks:
+    """Test suite for webhook registration and completion delivery."""
+
+    @pytest.fixture
+    def mock_db_session(self):
+        """Create a mock async database session."""
+        session = AsyncMock()
+        session.add = Mock()
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock()
+        session.execute = AsyncMock()
+        return session
+
+    @staticmethod
+    def make_review(status="pending", callback_url=None) -> Review:
+        now = datetime.now(UTC)
+        return Review(
+            id=str(uuid4()),
+            profile_id=str(uuid4()),
+            status=status,
+            callback_url=callback_url,
+            created_at=now,
+            updated_at=now,
+        )
+
+    @staticmethod
+    def make_result(obj):
+        """Mimic db.execute(...).scalars().first() returning obj."""
+        result = Mock()
+        result.scalars.return_value.first.return_value = obj
+        return result
+
+    async def run_process_review(self, db, review):
+        """Run process_review against a review and an empty profile."""
+        profile = Profile(id=review.profile_id, user_id=str(uuid4()))
+        db.execute = AsyncMock(side_effect=[self.make_result(review), self.make_result(profile)])
+        await process_review(db, review.id, profile.id)
+
+    # --- registration ---
+
+    @pytest.mark.asyncio
+    async def test_register_callback_url_persists_url(self, mock_db_session):
+        """Test registering a callback stores and commits callback_url."""
+        review = self.make_review(status="pending")
+
+        with (
+            patch("core.services.review_service.get_review", new=AsyncMock(return_value=review)),
+            patch("core.services.review_service.deliver_webhook", new=AsyncMock()),
+        ):
+            result = await register_callback_url(mock_db_session, review.id, uuid4(), CALLBACK_URL)
+
+        assert result is review
+        assert review.callback_url == CALLBACK_URL
+        mock_db_session.add.assert_called_once_with(review)
+        mock_db_session.commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_register_callback_url_missing_or_not_owned_returns_none(self, mock_db_session):
+        """Test registering for a missing/not-owned review returns None and writes nothing."""
+        user_id = uuid4()
+        review_id = uuid4()
+
+        with (
+            patch(
+                "core.services.review_service.get_review", new=AsyncMock(return_value=None)
+            ) as mock_get_review,
+            patch("core.services.review_service.deliver_webhook", new=AsyncMock()) as mock_deliver,
+        ):
+            result = await register_callback_url(mock_db_session, review_id, user_id, CALLBACK_URL)
+
+        assert result is None
+        mock_get_review.assert_called_once_with(mock_db_session, review_id, user_id)
+        mock_db_session.commit.assert_not_called()
+        mock_deliver.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["pending", "processing", "failed"])
+    async def test_register_callback_url_unfinished_review_does_not_deliver(
+        self, mock_db_session, status
+    ):
+        """Test registration does not send a webhook for a review that is not complete."""
+        review = self.make_review(status=status)
+
+        with (
+            patch("core.services.review_service.get_review", new=AsyncMock(return_value=review)),
+            patch("core.services.review_service.deliver_webhook", new=AsyncMock()) as mock_deliver,
+        ):
+            await register_callback_url(mock_db_session, review.id, uuid4(), CALLBACK_URL)
+
+        mock_deliver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_register_callback_url_complete_review_delivers_after_commit(
+        self, mock_db_session
+    ):
+        """Test registering on a completed review persists the URL, then delivers immediately."""
+        review = self.make_review(status="complete")
+        events = []
+        mock_db_session.commit = AsyncMock(
+            side_effect=lambda: events.append(("commit", review.callback_url))
+        )
+
+        async def fake_deliver(url, payload):
+            events.append(("deliver", url))
+            return True
+
+        with (
+            patch("core.services.review_service.get_review", new=AsyncMock(return_value=review)),
+            patch(
+                "core.services.review_service.deliver_webhook",
+                new=AsyncMock(side_effect=fake_deliver),
+            ) as mock_deliver,
+        ):
+            await register_callback_url(mock_db_session, review.id, uuid4(), CALLBACK_URL)
+
+        assert events == [("commit", CALLBACK_URL), ("deliver", CALLBACK_URL)]
+        payload = mock_deliver.call_args.args[1]
+        assert payload["id"] == review.id
+        assert payload["status"] == "complete"
+
+    @pytest.mark.asyncio
+    async def test_register_callback_url_delivery_failure_keeps_registration(self, mock_db_session):
+        """Test a failed immediate delivery neither raises nor rolls back the registration."""
+        review = self.make_review(status="complete")
+
+        with (
+            patch("core.services.review_service.get_review", new=AsyncMock(return_value=review)),
+            patch(
+                "core.services.review_service.deliver_webhook",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            result = await register_callback_url(mock_db_session, review.id, uuid4(), CALLBACK_URL)
+
+        assert result is review
+        assert review.callback_url == CALLBACK_URL
+        assert review.status == "complete"
+        mock_db_session.rollback.assert_not_called()
+
+    # --- completion delivery ---
+
+    @pytest.mark.asyncio
+    async def test_process_review_sends_public_payload_after_complete_commit(self, mock_db_session):
+        """Test a completed review with a callback POSTs the public ReviewResponse payload."""
+        review = self.make_review(callback_url=CALLBACK_URL)
+        events = []
+        mock_db_session.commit = AsyncMock(
+            side_effect=lambda: events.append(("commit", review.status))
+        )
+
+        async def fake_deliver(url, payload):
+            events.append(("deliver", url))
+            return True
+
+        with patch(
+            "core.services.review_service.deliver_webhook",
+            new=AsyncMock(side_effect=fake_deliver),
+        ) as mock_deliver:
+            await self.run_process_review(mock_db_session, review)
+
+        assert review.status == "complete"
+        mock_deliver.assert_called_once()
+        assert events[-2:] == [("commit", "complete"), ("deliver", CALLBACK_URL)]
+
+        url, payload = mock_deliver.call_args.args
+        assert url == CALLBACK_URL
+        assert payload == ReviewResponse.model_validate(review).model_dump(mode="json")
+        assert payload["status"] == "complete"
+        assert payload["sections"]
+        json.dumps(payload)  # must be JSON-safe
+
+    @pytest.mark.asyncio
+    async def test_process_review_without_callback_does_not_deliver(self, mock_db_session):
+        """Test a completed review with no callback_url makes no delivery attempt."""
+        review = self.make_review(callback_url=None)
+
+        with patch("core.services.review_service.deliver_webhook", new=AsyncMock()) as mock_deliver:
+            await self.run_process_review(mock_db_session, review)
+
+        assert review.status == "complete"
+        mock_deliver.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "deliver_mock",
+        [AsyncMock(return_value=False), AsyncMock(side_effect=RuntimeError("boom"))],
+        ids=["returns-false", "raises"],
+    )
+    async def test_process_review_delivery_failure_keeps_complete(
+        self, mock_db_session, deliver_mock
+    ):
+        """Test a webhook failure does not change a completed review to failed."""
+        review = self.make_review(callback_url=CALLBACK_URL)
+
+        with patch("core.services.review_service.deliver_webhook", new=deliver_mock):
+            await self.run_process_review(mock_db_session, review)
+
+        deliver_mock.assert_called_once()
+        assert review.status == "complete"

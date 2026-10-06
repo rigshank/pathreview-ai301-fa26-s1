@@ -5,10 +5,11 @@ from uuid import UUID
 import structlog
 from sqlalchemy import and_, select
 
-from api.schemas.review import FeedbackSection
+from api.schemas.review import FeedbackSection, ReviewResponse
 from core.models.ingested_source import IngestedSource
 from core.models.profile import Profile
 from core.models.review import Review
+from core.services.webhook_service import deliver_webhook
 
 log = structlog.get_logger()
 
@@ -78,6 +79,32 @@ async def list_reviews(
     reviews = result.scalars().all()
 
     return reviews, total
+
+
+async def register_callback_url(
+    db,
+    review_id: UUID,
+    user_id: UUID,
+    callback_url: str,
+) -> Review | None:
+    """
+    Store a webhook callback URL on a review, checking ownership.
+    If the review is already complete, deliver it to the callback immediately.
+    """
+    review = await get_review(db, review_id, user_id)
+    if not review:
+        return None
+
+    review.callback_url = callback_url
+    db.add(review)
+    await db.commit()
+    await db.refresh(review)
+
+    # The review may have finished before the callback was registered.
+    if review.status == "complete":
+        await _deliver_completion_webhook(db, review)
+
+    return review
 
 
 async def process_review(
@@ -180,6 +207,8 @@ async def process_review(
             overall_score=review.overall_score,
         )
 
+        await _deliver_completion_webhook(db, review)
+
     except Exception as exc:
         log.error("review_processing_failed", review_id=str(review_id), error=str(exc))
         try:
@@ -193,6 +222,24 @@ async def process_review(
                 await db.commit()
         except Exception as e:
             log.error("review_status_update_failed", review_id=str(review_id), error=str(e))
+
+
+async def _deliver_completion_webhook(db, review: Review) -> None:
+    """
+    Send the completed review to its registered callback URL, if any.
+    Errors are logged and swallowed so they cannot mark the review failed.
+    """
+    try:
+        # Re-read callback_url: it may have been registered by another request
+        # after this session loaded the review.
+        await db.refresh(review, attribute_names=["callback_url"])
+        if not review.callback_url:
+            return
+
+        payload = ReviewResponse.model_validate(review).model_dump(mode="json")
+        await deliver_webhook(review.callback_url, payload)
+    except Exception as exc:
+        log.error("review_webhook_dispatch_failed", review_id=str(review.id), error=str(exc))
 
 
 async def _run_ingestion_pipeline(db, profile: Profile) -> list[dict]:

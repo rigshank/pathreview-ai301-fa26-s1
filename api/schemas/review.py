@@ -1,7 +1,8 @@
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl, UrlConstraints
 
 
 class FeedbackSection(BaseModel):
@@ -33,3 +34,13 @@ class ReviewListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class WebhookRegister(BaseModel):
+    callback_url: Annotated[HttpUrl, UrlConstraints(max_length=500)]
+
+
+class WebhookRegisterResponse(BaseModel):
+    review_id: UUID
+    callback_url: str
+    status: str
